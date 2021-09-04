@@ -1,0 +1,2845 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/instance: stackstorm
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: mongodb
+    helm.sh/chart: mongodb-10.0.1
+  name: stackstorm-mongodb
+  namespace: stackstorm
+secrets:
+- name: stackstorm-mongodb
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/instance: stackstorm
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: rabbitmq
+    helm.sh/chart: rabbitmq-8.0.2
+  name: stackstorm-rabbitmq
+  namespace: stackstorm
+secrets:
+- name: stackstorm-rabbitmq
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app: stackstorm-ha
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+  name: stackstorm-ha
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/instance: stackstorm
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: rabbitmq
+    helm.sh/chart: rabbitmq-8.0.2
+  name: stackstorm-rabbitmq-endpoint-reader
+  namespace: stackstorm
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - endpoints
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/instance: stackstorm
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: rabbitmq
+    helm.sh/chart: rabbitmq-8.0.2
+  name: stackstorm-rabbitmq-endpoint-reader
+  namespace: stackstorm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: stackstorm-rabbitmq-endpoint-reader
+subjects:
+- kind: ServiceAccount
+  name: stackstorm-rabbitmq
+---
+apiVersion: v1
+data:
+  setup.sh: |-
+    #!/bin/bash
+
+    echo "Advertised Hostname: $MONGODB_ADVERTISED_HOSTNAME"
+
+    if [[ "$MY_POD_NAME" = "stackstorm-mongodb-0" ]]; then
+        echo "Pod name matches initial primary pod name, configuring node as a primary"
+        export MONGODB_REPLICA_SET_MODE="primary"
+    else
+        echo "Pod name doesn't match initial primary pod name, configuring node as a secondary"
+        export MONGODB_REPLICA_SET_MODE="secondary"
+        export MONGODB_INITIAL_PRIMARY_ROOT_PASSWORD="$MONGODB_ROOT_PASSWORD"
+        export MONGODB_INITIAL_PRIMARY_PORT_NUMBER="$MONGODB_PORT_NUMBER"
+        export MONGODB_ROOT_PASSWORD="" MONGODB_USERNAME="" MONGODB_DATABASE="" MONGODB_PASSWORD=""
+    fi
+
+    exec /opt/bitnami/scripts/mongodb/entrypoint.sh /opt/bitnami/scripts/mongodb/run.sh
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/component: mongodb
+    app.kubernetes.io/instance: stackstorm
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: mongodb
+    helm.sh/chart: mongodb-10.0.1
+  name: stackstorm-mongodb-scripts
+  namespace: stackstorm
+---
+apiVersion: v1
+data:
+  rabbitmq.conf: |-
+    ## Username and password
+    default_user = admin
+    default_pass = CHANGEME
+    ## Clustering
+    cluster_formation.peer_discovery_backend  = rabbit_peer_discovery_k8s
+    cluster_formation.k8s.host = kubernetes.default.svc.cluster.local
+    cluster_formation.node_cleanup.interval = 10
+    cluster_formation.node_cleanup.only_log_warning = true
+    cluster_partition_handling = autoheal
+    # queue master locator
+    queue_master_locator = min-masters
+    # enable guest user
+    loopback_users.guest = false
+    load_definitions = /app/rabbitmq-definitions.json
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: stackstorm
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: rabbitmq
+    helm.sh/chart: rabbitmq-8.0.2
+  name: stackstorm-rabbitmq-config
+  namespace: stackstorm
+---
+apiVersion: v1
+data:
+  master.conf: |-
+    dir /data
+    rename-command FLUSHDB ""
+    rename-command FLUSHALL ""
+  redis.conf: |-
+    # User-supplied configuration:
+    # Enable AOF https://redis.io/topics/persistence#append-only-file
+    appendonly yes
+    # Disable RDB persistence, AOF persistence already enabled.
+    save ""
+  replica.conf: |-
+    dir /data
+    slave-read-only yes
+    rename-command FLUSHDB ""
+    rename-command FLUSHALL ""
+  sentinel.conf: |-
+    dir "/tmp"
+    bind 0.0.0.0
+    port 26379
+    sentinel monitor mymaster stackstorm-redis-node-0.stackstorm-redis-headless.stackstorm.svc.cluster.local 6379 2
+    sentinel down-after-milliseconds mymaster 60000
+    sentinel failover-timeout mymaster 18000
+    sentinel parallel-syncs mymaster 1
+kind: ConfigMap
+metadata:
+  labels:
+    app: redis
+    chart: redis-12.3.2
+    heritage: Helm
+    release: stackstorm
+  name: stackstorm-redis
+  namespace: stackstorm
+---
+apiVersion: v1
+data:
+  parse_sentinels.awk: |-
+    /ip/ {FOUND_IP=1}
+    /port/ {FOUND_PORT=1}
+    /runid/ {FOUND_RUNID=1}
+    !/ip|port|runid/ {
+      if (FOUND_IP==1) {
+        IP=$1; FOUND_IP=0;
+      }
+      else if (FOUND_PORT==1) {
+        PORT=$1;
+        FOUND_PORT=0;
+      } else if (FOUND_RUNID==1) {
+        printf "\nsentinel known-sentinel mymaster %s %s %s", IP, PORT, $0; FOUND_RUNID=0;
+      }
+    }
+  ping_liveness_local.sh: |-
+    #!/bin/bash
+    export REDISCLI_AUTH="$REDIS_PASSWORD"
+    response=$(
+      timeout -s 3 $1 \
+      redis-cli \
+        -h localhost \
+        -p $REDIS_PORT \
+        ping
+    )
+    if [ "$response" != "PONG" ] && [ "$response" != "LOADING Redis is loading the dataset in memory" ]; then
+      echo "$response"
+      exit 1
+    fi
+  ping_liveness_local_and_master.sh: |-
+    script_dir="$(dirname "$0")"
+    exit_status=0
+    "$script_dir/ping_liveness_local.sh" $1 || exit_status=$?
+    "$script_dir/ping_liveness_master.sh" $1 || exit_status=$?
+    exit $exit_status
+  ping_liveness_master.sh: |-
+    #!/bin/bash
+    export REDISCLI_AUTH="$REDIS_MASTER_PASSWORD"
+    response=$(
+      timeout -s 3 $1 \
+      redis-cli \
+        -h $REDIS_MASTER_HOST \
+        -p $REDIS_MASTER_PORT_NUMBER \
+        ping
+    )
+    if [ "$response" != "PONG" ] && [ "$response" != "LOADING Redis is loading the dataset in memory" ]; then
+      echo "$response"
+      exit 1
+    fi
+  ping_readiness_local.sh: |-
+    #!/bin/bash
+    export REDISCLI_AUTH="$REDIS_PASSWORD"
+    response=$(
+      timeout -s 3 $1 \
+      redis-cli \
+        -h localhost \
+        -p $REDIS_PORT \
+        ping
+    )
+    if [ "$response" != "PONG" ]; then
+      echo "$response"
+      exit 1
+    fi
+  ping_readiness_local_and_master.sh: |-
+    script_dir="$(dirname "$0")"
+    exit_status=0
+    "$script_dir/ping_readiness_local.sh" $1 || exit_status=$?
+    "$script_dir/ping_readiness_master.sh" $1 || exit_status=$?
+    exit $exit_status
+  ping_readiness_master.sh: |-
+    #!/bin/bash
+    export REDISCLI_AUTH="$REDIS_MASTER_PASSWORD"
+    response=$(
+      timeout -s 3 $1 \
+      redis-cli \
+        -h $REDIS_MASTER_HOST \
+        -p $REDIS_MASTER_PORT_NUMBER \
+        ping
+    )
+    if [ "$response" != "PONG" ]; then
+      echo "$response"
+      exit 1
+    fi
+  ping_sentinel.sh: |-
+    #!/bin/bash
+    export REDISCLI_AUTH="$REDIS_PASSWORD"
+    response=$(
+      timeout -s 3 $1 \
+      redis-cli \
+        -h localhost \
+        -p $REDIS_SENTINEL_PORT \
+        ping
+    )
+    if [ "$response" != "PONG" ]; then
+      echo "$response"
+      exit 1
+    fi
+kind: ConfigMap
+metadata:
+  labels:
+    app: redis
+    chart: redis-12.3.2
+    heritage: Helm
+    release: stackstorm
+  name: stackstorm-redis-health
+  namespace: stackstorm
+---
+apiVersion: v1
+data:
+  start-node.sh: |
+    #!/bin/bash
+    is_boolean_yes() {
+        local -r bool="${1:-}"
+        # comparison is performed without regard to the case of alphabetic characters
+        shopt -s nocasematch
+        if [[ "$bool" = 1 || "$bool" =~ ^(yes|true)$ ]]; then
+            true
+        else
+            false
+        fi
+    }
+
+    HEADLESS_SERVICE="stackstorm-redis-headless.stackstorm.svc.cluster.local"
+    REDIS_SERVICE="stackstorm-redis.stackstorm.svc.cluster.local"
+
+    export REDIS_REPLICATION_MODE="slave"
+    if [[ -z "$(getent ahosts "$HEADLESS_SERVICE" | grep -v "^$(hostname -i) ")" ]]; then
+      export REDIS_REPLICATION_MODE="master"
+    fi
+
+    if [[ -n $REDIS_PASSWORD_FILE ]]; then
+      password_aux=`cat ${REDIS_PASSWORD_FILE}`
+      export REDIS_PASSWORD=$password_aux
+    fi
+
+    if [[ -n $REDIS_MASTER_PASSWORD_FILE ]]; then
+      password_aux=`cat ${REDIS_MASTER_PASSWORD_FILE}`
+      export REDIS_MASTER_PASSWORD=$password_aux
+    fi
+
+    if [[ "$REDIS_REPLICATION_MODE" == "master" ]]; then
+      echo "I am master"
+      if [[ ! -f /opt/bitnami/redis/etc/master.conf ]];then
+        cp /opt/bitnami/redis/mounted-etc/master.conf /opt/bitnami/redis/etc/master.conf
+      fi
+    else
+      if [[ ! -f /opt/bitnami/redis/etc/replica.conf ]];then
+        cp /opt/bitnami/redis/mounted-etc/replica.conf /opt/bitnami/redis/etc/replica.conf
+      fi
+
+      if is_boolean_yes "$REDIS_TLS_ENABLED"; then
+        sentinel_info_command="redis-cli -h $REDIS_SERVICE -p 26379 --tls --cert ${REDIS_TLS_CERT_FILE} --key ${REDIS_TLS_KEY_FILE} --cacert ${REDIS_TLS_CA_FILE} sentinel get-master-addr-by-name mymaster"
+      else
+        sentinel_info_command="redis-cli -h $REDIS_SERVICE -p 26379 sentinel get-master-addr-by-name mymaster"
+      fi
+      REDIS_SENTINEL_INFO=($($sentinel_info_command))
+      REDIS_MASTER_HOST=${REDIS_SENTINEL_INFO[0]}
+      REDIS_MASTER_PORT_NUMBER=${REDIS_SENTINEL_INFO[1]}
+
+
+      # Immediately attempt to connect to the reported master. If it doesn't exist the connection attempt will either hang
+      # or fail with "port unreachable" and give no data. The liveness check will then timeout waiting for the redis
+      # container to be ready and restart the it. By then the new master will likely have been elected
+      if is_boolean_yes "$REDIS_TLS_ENABLED"; then
+        sentinel_info_command="redis-cli -h $REDIS_MASTER_HOST -p 26379 --tls --cert ${REDIS_TLS_CERT_FILE} --key ${REDIS_TLS_KEY_FILE} --cacert ${REDIS_TLS_CA_FILE} sentinel get-master-addr-by-name mymaster"
+      else
+        sentinel_info_command="redis-cli -h $REDIS_MASTER_HOST -p 26379 sentinel get-master-addr-by-name mymaster"
+      fi
+
+      if [[ ! ($($sentinel_info_command)) ]]; then
+        # master doesn't actually exist, this probably means the remaining pods haven't elected a new one yet
+        # and are reporting the old one still. Once this happens the container will get stuck and never see the new
+        # master. We stop here to allow the container to not pass the liveness check and be restarted.
+        exit 1
+      fi
+    fi
+
+    if [[ ! -f /opt/bitnami/redis/etc/redis.conf ]];then
+      cp /opt/bitnami/redis/mounted-etc/redis.conf /opt/bitnami/redis/etc/redis.conf
+    fi
+    ARGS=("--port" "${REDIS_PORT}")
+
+    if [[ "$REDIS_REPLICATION_MODE" == "slave" ]]; then
+      ARGS+=("--slaveof" "${REDIS_MASTER_HOST}" "${REDIS_MASTER_PORT_NUMBER}")
+    fi
+    ARGS+=("--protected-mode" "no")
+
+    if [[ "$REDIS_REPLICATION_MODE" == "master" ]]; then
+      ARGS+=("--include" "/opt/bitnami/redis/etc/master.conf")
+    else
+      ARGS+=("--include" "/opt/bitnami/redis/etc/replica.conf")
+    fi
+
+    ARGS+=("--include" "/opt/bitnami/redis/etc/redis.conf")
+    exec /run.sh "${ARGS[@]}"
+  start-sentinel.sh: |
+    #!/bin/bash
+    replace_in_file() {
+        local filename="${1:?filename is required}"
+        local match_regex="${2:?match regex is required}"
+        local substitute_regex="${3:?substitute regex is required}"
+        local posix_regex=${4:-true}
+
+        local result
+
+        # We should avoid using 'sed in-place' substitutions
+        # 1) They are not compatible with files mounted from ConfigMap(s)
+        # 2) We found incompatibility issues with Debian10 and "in-place" substitutions
+        del=$'\001' # Use a non-printable character as a 'sed' delimiter to avoid issues
+        if [[ $posix_regex = true ]]; then
+            result="$(sed -E "s${del}${match_regex}${del}${substitute_regex}${del}g" "$filename")"
+        else
+            result="$(sed "s${del}${match_regex}${del}${substitute_regex}${del}g" "$filename")"
+        fi
+        echo "$result" > "$filename"
+    }
+    sentinel_conf_set() {
+        local -r key="${1:?missing key}"
+        local value="${2:-}"
+
+        # Sanitize inputs
+        value="${value//\\/\\\\}"
+        value="${value//&/\\&}"
+        value="${value//\?/\\?}"
+        [[ "$value" = "" ]] && value="\"$value\""
+
+        replace_in_file "/opt/bitnami/redis-sentinel/etc/sentinel.conf" "^#*\s*${key} .*" "${key} ${value}" false
+    }
+    sentinel_conf_add() {
+        echo $'\n'"$@" >> "/opt/bitnami/redis-sentinel/etc/sentinel.conf"
+    }
+    is_boolean_yes() {
+        local -r bool="${1:-}"
+        # comparison is performed without regard to the case of alphabetic characters
+        shopt -s nocasematch
+        if [[ "$bool" = 1 || "$bool" =~ ^(yes|true)$ ]]; then
+            true
+        else
+            false
+        fi
+    }
+    host_id() {
+      echo "$1" | openssl sha1 | awk '{print $2}'
+    }
+
+    HEADLESS_SERVICE="stackstorm-redis-headless.stackstorm.svc.cluster.local"
+    REDIS_SERVICE="stackstorm-redis.stackstorm.svc.cluster.local"
+
+    if [[ -n $REDIS_PASSWORD_FILE ]]; then
+      password_aux=`cat ${REDIS_PASSWORD_FILE}`
+      export REDIS_PASSWORD=$password_aux
+    fi
+
+    if [[ ! -f /opt/bitnami/redis-sentinel/etc/sentinel.conf ]]; then
+      cp /opt/bitnami/redis-sentinel/mounted-etc/sentinel.conf /opt/bitnami/redis-sentinel/etc/sentinel.conf
+    fi
+
+    export REDIS_REPLICATION_MODE="slave"
+    if [[ -z "$(getent ahosts "$HEADLESS_SERVICE" | grep -v "^$(hostname -i) ")" ]]; then
+      export REDIS_REPLICATION_MODE="master"
+    fi
+
+    if [[ "$REDIS_REPLICATION_MODE" == "master" ]]; then
+      REDIS_MASTER_HOST="$(hostname -i)"
+      REDIS_MASTER_PORT_NUMBER="6379"
+    else
+      if is_boolean_yes "$REDIS_SENTINEL_TLS_ENABLED"; then
+        sentinel_info_command="redis-cli -h $REDIS_SERVICE -p 26379 --tls --cert ${REDIS_SENTINEL_TLS_CERT_FILE} --key ${REDIS_SENTINEL_TLS_KEY_FILE} --cacert ${REDIS_SENTINEL_TLS_CA_FILE} sentinel get-master-addr-by-name mymaster"
+      else
+        sentinel_info_command="redis-cli -h $REDIS_SERVICE -p 26379 sentinel get-master-addr-by-name mymaster"
+      fi
+      REDIS_SENTINEL_INFO=($($sentinel_info_command))
+      REDIS_MASTER_HOST=${REDIS_SENTINEL_INFO[0]}
+      REDIS_MASTER_PORT_NUMBER=${REDIS_SENTINEL_INFO[1]}
+
+      # Immediately attempt to connect to the reported master. If it doesn't exist the connection attempt will either hang
+      # or fail with "port unreachable" and give no data. The liveness check will then timeout waiting for the sentinel
+      # container to be ready and restart the it. By then the new master will likely have been elected
+      if is_boolean_yes "$REDIS_SENTINEL_TLS_ENABLED"; then
+        sentinel_info_command="redis-cli -h $REDIS_MASTER_HOST -p 26379 --tls --cert ${REDIS_SENTINEL_TLS_CERT_FILE} --key ${REDIS_SENTINEL_TLS_KEY_FILE} --cacert ${REDIS_SENTINEL_TLS_CA_FILE} sentinel get-master-addr-by-name mymaster"
+      else
+        sentinel_info_command="redis-cli -h $REDIS_MASTER_HOST -p 26379 sentinel get-master-addr-by-name mymaster"
+      fi
+
+      if [[ ! ($($sentinel_info_command)) ]]; then
+        # master doesn't actually exist, this probably means the remaining pods haven't elected a new one yet
+        # and are reporting the old one still. Once this happens the container will get stuck and never see the new
+        # master. We stop here to allow the container to not pass the liveness check and be restarted.
+        exit 1
+      fi
+    fi
+    sentinel_conf_set "sentinel monitor" "mymaster "$REDIS_MASTER_HOST" "$REDIS_MASTER_PORT_NUMBER" 2"
+
+    add_replica() {
+      if [[ "$1" != "$REDIS_MASTER_HOST" ]]; then
+        sentinel_conf_add "sentinel known-replica mymaster $1 6379"
+      fi
+    }
+    exec redis-server /opt/bitnami/redis-sentinel/etc/sentinel.conf --sentinel
+kind: ConfigMap
+metadata:
+  labels:
+    app: redis
+    chart: redis-12.3.2
+    heritage: Helm
+    release: stackstorm
+  name: stackstorm-redis-scripts
+  namespace: stackstorm
+---
+apiVersion: v1
+data:
+  st2.docker.conf: |
+    [auth]
+    api_url = http://stackstorm-st2api:9101/
+    [coordination]
+    url = redis://stackstorm-redis-node-0.stackstorm-redis-headless:26379?sentinel=mymaster&sentinel_fallback=stackstorm-redis-node-1.stackstorm-redis-headless:26379&sentinel_fallback=stackstorm-redis-node-2.stackstorm-redis-headless:26379
+    [messaging]
+    url = amqp://admin:9jS+w1u07NbHtZke1m+jW4Cj@stackstorm-rabbitmq:5672/
+    [database]
+    host = mongodb://stackstorm-mongodb-0.stackstorm-mongodb-headless,stackstorm-mongodb-1.stackstorm-mongodb-headless,stackstorm-mongodb-2.stackstorm-mongodb-headless/st2?authSource=st2&replicaSet=rs0
+    username = st2-admin
+    password = XeL5Rxwj7F0Wt43tFZVTN7H8Sg5XDHmK
+    db_name = st2
+    port = 27017
+  st2.user.conf: |
+    [api]
+    allow_origin = '*'
+kind: ConfigMap
+metadata:
+  annotations:
+    description: Custom StackStorm config which will apply settings on top of default
+      st2.conf
+  labels:
+    app: st2
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2-config
+---
+apiVersion: v1
+data:
+  core.yaml: |
+    ---
+    # example core pack config yaml
+kind: ConfigMap
+metadata:
+  annotations:
+    description: Custom StackStorm pack configs, shipped in '/opt/stackstorm/configs/'
+  labels:
+    app: st2
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2-pack-configs
+---
+apiVersion: v1
+data:
+  ST2_API_URL: http://stackstorm-st2api:9101/
+  ST2_AUTH_URL: http://stackstorm-st2auth:9100/
+  ST2_STREAM_URL: http://stackstorm-st2stream:9102/
+kind: ConfigMap
+metadata:
+  annotations:
+    description: StackStorm service URLs, used across entire st2 cluster
+  labels:
+    app: st2
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2-urls
+---
+apiVersion: v1
+data:
+  st2tests.sh: |
+    #!/usr/bin/env bats
+
+    load "${BATS_HELPERS_DIR}/bats-support/load.bash"
+    load "${BATS_HELPERS_DIR}/bats-assert/load.bash"
+    load "${BATS_HELPERS_DIR}/bats-file/load.bash"
+
+    @test 'st2 version deployed and python env are as expected' {
+      run st2 --version
+      assert_success
+      # st2 3.3dev (9ea417346), on Python 3.6.9
+      assert_line --partial "st2 ${ST2_VERSION}"
+      assert_line --partial 'on Python 3.6.9'
+    }
+
+    @test 'ST2_AUTH_URL service endpoint is accessible and working' {
+      run curl -v ${ST2_API_URL}
+      assert_line --partial 'Content-Type: application/json'
+      assert_line --partial 'St2-Api-Key'
+    }
+
+    @test 'ST2_API_URL service endpoint is accessible and working' {
+      run curl -v ${ST2_API_URL}
+      assert_line --partial 'Content-Type: application/json'
+      assert_line --partial 'St2-Api-Key'
+    }
+
+    @test 'ST2_STREAM_URL service endpoint is accessible and working' {
+      run curl -v ${ST2_API_URL}
+      assert_line --partial 'Content-Type: application/json'
+      assert_line --partial 'St2-Api-Key'
+    }
+
+    @test 'st2 user can log in with auth credentials' {
+      run st2 login ${ST2_AUTH_USERNAME} --password ${ST2_AUTH_PASSWORD} -w
+      assert_success
+      assert_line "Logged in as ${ST2_AUTH_USERNAME}"
+      assert_file_exist ~/.st2/config
+    }
+
+    @test 'st2 core pack is installed and loaded' {
+      run st2 action list --pack=core
+      assert_success
+      assert_line --partial 'core.local'
+    }
+
+    @test "can execute simple st2 action 'core.local'" {
+      run st2 run core.local cmd=id
+      assert_success
+      assert_line --partial 'return_code: 0'
+      assert_line --partial "stderr: ''"
+      assert_line --partial 'stdout: uid=1000(stanley) gid=1000(stanley) groups=1000(stanley)'
+      assert_line --partial 'succeeded: true'
+    }
+
+    @test 'st2 chatops core rule is loaded' {
+      run st2 rule list
+      assert_success
+      assert_line --partial 'chatops.notify'
+    }
+
+    @test 'st2 key/value operations are functional' {
+      run st2 key set foo bar
+      assert_success
+
+      run st2 key get foo
+      assert_success
+      assert_line --partial 'bar'
+
+      run st2 key delete foo
+      assert_line --partial '"foo" has been successfully deleted'
+      assert_success
+
+      run st2 key get foo
+      assert_line --partial '"foo" is not found'
+      assert_failure
+    }
+
+    @test 'RBAC is loaded and enabled' {
+      if [ $ST2_RBAC_ENABLED != "true" ]; then
+        skip "disabled in Helm values"
+      fi
+
+      run st2 whoami
+      assert_success
+      assert_output --regexp 'RBAC:\s+ - Enabled: True'
+      assert_line --partial 'Roles: system_admin'
+    }
+kind: ConfigMap
+metadata:
+  labels:
+    app: st2tests
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: tests
+    vendor: stackstorm
+  name: stackstorm-st2tests
+---
+apiVersion: v1
+data:
+  mongodb-password: WGVMNVJ4d2o3RjBXdDQzdEZaVlRON0g4U2c1WERIbUs=
+  mongodb-replica-set-key: ODJQSXREcHFyb3RpNVJuZ09BN1VxYkhIN2M2YkZVd3k=
+  mongodb-root-password: OGZBemRua3NkelBGVVdtNGE2OEVmWTduTWhCUGFh
+kind: Secret
+metadata:
+  labels:
+    app.kubernetes.io/component: mongodb
+    app.kubernetes.io/instance: stackstorm
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: mongodb
+    helm.sh/chart: mongodb-10.0.1
+  name: stackstorm-mongodb
+  namespace: stackstorm
+type: Opaque
+---
+apiVersion: v1
+data:
+  rabbitmq-erlang-cookie: OE1ycVFkQ1E2QVE4VTNNYWNTdWJIRTVScWtTZnZOYVJIenZ4dUZjRw==
+  rabbitmq-password: OWpTK3cxdTA3TmJIdFprZTFtK2pXNENq
+kind: Secret
+metadata:
+  labels:
+    app.kubernetes.io/instance: stackstorm
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: rabbitmq
+    helm.sh/chart: rabbitmq-8.0.2
+  name: stackstorm-rabbitmq
+  namespace: stackstorm
+type: Opaque
+---
+apiVersion: v1
+data:
+  rabbitmq-definitions.json: ewogICJ1c2VycyI6IFsKICAgIHsKICAgICAgIm5hbWUiOiAiYWRtaW4iLAogICAgICAicGFzc3dvcmQiOiAiOWpTK3cxdTA3TmJIdFprZTFtK2pXNENqIiwKICAgICAgInRhZ3MiOiAiYWRtaW5pc3RyYXRvciIKICAgIH0KICBdLAogICJwZXJtaXNzaW9ucyI6IFsKICAgIHsKICAgICAgInVzZXIiOiAiYWRtaW4iLAogICAgICAidmhvc3QiOiAiLyIsCiAgICAgICJjb25maWd1cmUiOiAiLioiLAogICAgICAid3JpdGUiOiAiLioiLAogICAgICAicmVhZCI6ICIuKiIKICAgIH0KICBdLAogICJ2aG9zdHMiOiBbCiAgICB7CiAgICAgICJuYW1lIjogIi8iCiAgICB9CiAgXSwKICAicG9saWNpZXMiOiBbCiAgICB7CiAgICAgICJ2aG9zdCI6Ii8iLAogICAgICAibmFtZSI6ImhhIiwKICAgICAgInBhdHRlcm4iOiIiLAogICAgICAiZGVmaW5pdGlvbiI6IHsKICAgICAgICAiaGEtbW9kZSI6ImFsbCIsCiAgICAgICAgImhhLXN5bmMtbW9kZSI6ICJhdXRvbWF0aWMiLAogICAgICAgICJoYS1zeW5jLWJhdGNoLXNpemUiOjEwCiAgICAgIH0KICAgIH0KICBdCn0K
+kind: Secret
+metadata:
+  annotations:
+    description: A rabbitmq definition which will be loaded by the rabbitmq subchart
+      to enable mirroring for Rabbit HA
+  labels:
+    app: st2
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-rabbitmq-definitions
+type: Opaque
+---
+apiVersion: v1
+data:
+  apikeys.yaml: bnVsbA==
+kind: Secret
+metadata:
+  annotations:
+    description: A list of StackStorm API keys with metadata that will be imported
+      into the system
+  labels:
+    app: st2
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2-apikeys
+type: Opaque
+---
+apiVersion: v1
+data:
+  password: Q2hAbmdlTWU=
+  username: c3QyYWRtaW4=
+kind: Secret
+metadata:
+  annotations:
+    description: StackStorm username and password, used for basic .htaccess auth
+  labels:
+    app: st2
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2-auth
+type: Opaque
+---
+apiVersion: v1
+data:
+  st2kv.yaml: bnVsbA==
+kind: Secret
+metadata:
+  annotations:
+    description: Key/Value pairs to save in StackStorm's datastore
+  labels:
+    app: st2
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2-kv
+type: Opaque
+---
+apiVersion: v1
+data:
+  private_key: LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQpNSUlFb3dJQkFBS0NBUUVBczcza2JsTjNYZkxSNnRZc0hSSHlYL2FRS3g0YW1jTmpUK0UrMnVmd3FraUlORHlBCkNHaW0wWjRXRk9FTzZVdFpBcGVPbFVlaHAyTUVGR0ZwbDJ1OHZVQzFiN0FzV2FJbUI0eXdNSVBPRmJscWFFYWcKRHNrckZwN0ZPZ2dxWkZXWDdOd1ZacG0vS2t2Q3cvZkNlaG54dXYremEraFV0ZzRRaXY4NnFYU2hybHNuOThCNwo2NEFxMjdveGt2aFJVMk9rRFVQL3dQTlFuWHpJWnhmRllTdlM3ckd6S3Jzd2RaZld5c3NjSVVvcjRhKzdHYWhNCnlxOFBHRDZxcDJ3a2lMN3dGYXJaZXJTMlNxM00wNlk4OXl6cHBDb1BZSTZrYUVQdXFyalNZWnZoMzhDQVZiR0cKU2dQdjNDRmdSMU4zQnNCRUF4N09GKzQwUjU4QyszbGRIOGUxdFFJREFRQUJBb0lCQVFDTjcxMzdZUjNacW0zcApxOGFhRGhuL2ZZeksvN0t4eVlFYkN4dS9jWGl5ZnlSUFc1Y2ZETVR1c285dFhXdVEvbGNEblBxVEYwV29FS0NnCkYyeHlqamswbVd5dERjbDMzbnQ1YXJlWEYvNGRXWldWVW5BQ1BRa3hpNTdpL0orOUszb1ZLSllkdHpzbUF6MkIKMHB4WUh6U3NIazlvM3NaR0hVVWkvZmtzNTFUbGdQTmdPUDhoZjcvSzl3OStGU0UyNmdlcWpkZHFXd1FiYlN0SQpyRGMzWlBNY0dJNEU1RHVHbW5yeFdmNG9tVXFTY1RCK2J2VWdOK1dDMDJ2MUJqNEhhQVg3UGxMQ1VaTXVUazNTCkJjRzR2N3FpZ2x4VllkQmp0SE53dGcxWUFvVlloNnNYY2t4cWkxWHVkaG9SWEdsZ1l0eXJjVzBtV25uQjRoSVEKdnk3Ly91QUJBb0dCQU53OEgxaDkzVTFITnNxZklhMVlzM3U2cVpkSEJ5SHZBOGU3Sms2R0VGVUVPQVFTeXhaKwowUmJGV0M0a251UUwrWWtscWVETkNYZWt3VkV2VmVuZjJsaFo0ckhOYm12LzlwV2hxN3NRY0RPUVBpNW5WeEpsCmJrUW9Ra2VOR2VIOEtQRjFFMlJzZko4dVUzTmZEMDB5TUZyTmFlQlVJbFk0NEFCTU9RU0pSRXExQW9HQkFORHUKVjBJVjFCYWhxRVc1bW1uVGRITEc2K3RpU1FkdXRyUXY0aHhCTDU5UGh3eWVNdnB6Rmd3a05teW1BWk1MbDQwRApZLzB3ZzJsVnI3RmIrcGVDckxwaU5NRVBXdi9hMzhJRVZURG03WWNzSFpheUVzYzF2ZGpkTW9aOGs1Vk5pMjVGCitsdlEvQ3hETnFKR1RORUJCWW1iNVFIb3BCaDhZb3d3SXJUMHlaOEJBb0dBRll0QUdieitTQS8rV1NYbCtub2gKM0ttdTYyQ0VYeHB0aVQxU2l2M3NYUlN6a2hwd2lYdlFZbVRkc20zY3FUeE9wYzdzWmxSSVo4N1RKbWoyQTVIbApYeDB6NHViUXRYbnRta2VkY0FnMG9hYXJub2gzYVJKSkRodk9HQWZDajJ2R2FaQmxYRDZNbGxuR3loTnpnTDYzCklqclQ3NkRyVnZuclY3d2RHOGQ5eWIwQ2dZQXVRRlQ0d0RSUFBrSXVEVVJ0b08zcWFyYlhTTTY1NG54M3J4SHoKQjBzdmpUOXNQNmt4WUVERk4wOEZCa3JhN25vQ01YbjFGc1JBa1VOdms5a0pxVmZyZXNvSzR3ZFdGSEhzVldFMgpqaWlPLytrYzd4YlJHc2lJTlk5MXppWXRxeGp1dEhjVDFGTyt5TEpUZ2hTSFFCNmxzK2tpWHduVWtkU1BEQ2ppCnZqM1VBUUtCZ0UxOW9TZGZLYnBLVHlIdTVycytsTi9LaWN0RHVNcnFBcmlXT0RDeWdaMS9YMUoxenBxdnBVYnQKV0U4QldMUTF2QlY2YzdWNFEwV3A2THVUbk5udnUvbHZWdWdKVy9UYnJ6Rnc2Q0ZlNWZFSVNtSUhBTW5xVno4eApPZE9KeWluU00xc3ZvQkduWWZ5QXFJTktycUNTR1NLbXBybE1vME1hM2VySTdTdW9qV0JTCi0tLS0tRU5EIFJTQSBQUklWQVRFIEtFWS0tLS0t
+kind: Secret
+metadata:
+  annotations:
+    description: StackStorm SSH secret key for 'stanley' user, used to run actions
+      on remote machines
+  labels:
+    app: st2
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2-ssh
+type: Opaque
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/component: mongodb
+    app.kubernetes.io/instance: stackstorm
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: mongodb
+    helm.sh/chart: mongodb-10.0.1
+  name: stackstorm-mongodb-headless
+  namespace: stackstorm
+spec:
+  clusterIP: None
+  ports:
+  - name: mongodb
+    port: 27017
+    targetPort: mongodb
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/component: mongodb
+    app.kubernetes.io/instance: stackstorm
+    app.kubernetes.io/name: mongodb
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: stackstorm
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: rabbitmq
+    helm.sh/chart: rabbitmq-8.0.2
+  name: stackstorm-rabbitmq
+  namespace: stackstorm
+spec:
+  ports:
+  - name: amqp
+    nodePort: null
+    port: 5672
+    targetPort: amqp
+  - name: epmd
+    nodePort: null
+    port: 4369
+    targetPort: epmd
+  - name: dist
+    nodePort: null
+    port: 25672
+    targetPort: dist
+  - name: http-stats
+    nodePort: null
+    port: 15672
+    targetPort: stats
+  selector:
+    app.kubernetes.io/instance: stackstorm
+    app.kubernetes.io/name: rabbitmq
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: stackstorm
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: rabbitmq
+    helm.sh/chart: rabbitmq-8.0.2
+  name: stackstorm-rabbitmq-headless
+  namespace: stackstorm
+spec:
+  clusterIP: None
+  ports:
+  - name: epmd
+    port: 4369
+    targetPort: epmd
+  - name: amqp
+    port: 5672
+    targetPort: amqp
+  - name: dist
+    port: 25672
+    targetPort: dist
+  - name: http-stats
+    port: 15672
+    targetPort: stats
+  selector:
+    app.kubernetes.io/instance: stackstorm
+    app.kubernetes.io/name: rabbitmq
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: redis
+    chart: redis-12.3.2
+    heritage: Helm
+    release: stackstorm
+  name: stackstorm-redis
+  namespace: stackstorm
+spec:
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: redis
+  - name: redis-sentinel
+    port: 26379
+    targetPort: redis-sentinel
+  selector:
+    app: redis
+    release: stackstorm
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: redis
+    chart: redis-12.3.2
+    heritage: Helm
+    release: stackstorm
+  name: stackstorm-redis-headless
+  namespace: stackstorm
+spec:
+  clusterIP: None
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: redis
+  - name: redis-sentinel
+    port: 26379
+    targetPort: redis-sentinel
+  publishNotReadyAddresses: true
+  selector:
+    app: redis
+    release: stackstorm
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    description: StackStorm st2api - service hosts the REST API endpoints that serve
+      requests from WebUI, CLI, ChatOps and other st2 services.
+  labels:
+    app: st2api
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2api
+spec:
+  ports:
+  - port: 9101
+    protocol: TCP
+  selector:
+    app: st2api
+    release: stackstorm
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    description: StackStorm st2auth - all authentication is managed by this service.
+  labels:
+    app: st2auth
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2auth
+spec:
+  ports:
+  - port: 9100
+    protocol: TCP
+  selector:
+    app: st2auth
+    release: stackstorm
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    description: StackStorm st2stream - exposes a server-sent event stream, used by
+      the clients like WebUI and ChatOps to receive update from the st2stream server.
+  labels:
+    app: st2stream
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2stream
+spec:
+  ports:
+  - port: 9102
+    protocol: TCP
+  selector:
+    app: st2stream
+    release: stackstorm
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    description: StackStorm st2web, - an admin Web UI and main entry point for external
+      API requests
+  labels:
+    app: st2web
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: frontend
+    vendor: stackstorm
+  name: stackstorm-st2web
+spec:
+  ports:
+  - port: 80
+    protocol: TCP
+  selector:
+    app: st2web
+    release: stackstorm
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: st2actionrunner
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2actionrunner
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: st2actionrunner
+      release: stackstorm
+  template:
+    metadata:
+      annotations:
+        checksum/config: 2cecfe3bc433d799634db9c906275d6ffa3ff5eb673367d9046a0acd70b4a77d
+        checksum/datastore-key: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
+        checksum/ssh: fccd3cffc6939157ebf1ebfd1b289b23ce28bae718ff79b907f5fdb920b186ad
+      labels:
+        app: st2actionrunner
+        chart: stackstorm-ha-0.60.0
+        heritage: Helm
+        release: stackstorm
+        tier: backend
+        vendor: stackstorm
+    spec:
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+        image: stackstorm/st2actionrunner:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: st2actionrunner
+        resources:
+          requests:
+            cpu: 75m
+            memory: 200Mi
+        volumeMounts:
+        - mountPath: /etc/st2/st2.docker.conf
+          name: st2-config-vol
+          subPath: st2.docker.conf
+        - mountPath: /etc/st2/st2.user.conf
+          name: st2-config-vol
+          subPath: st2.user.conf
+        - mountPath: /home/stanley/.ssh/
+          name: st2-ssh-key-vol
+          readOnly: true
+      imagePullSecrets: null
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - "until nc -z -w 2 stackstorm-mongodb-headless 27017 && echo mongodb ok;\n
+          \ do \n    echo 'Waiting for MongoDB Connection...'\n    sleep 2;\ndone\n"
+        image: busybox:1.28
+        name: wait-for-db
+      - command:
+        - sh
+        - -c
+        - |
+          until nc -z -w 2 stackstorm-rabbitmq 5672 && echo rabbitmq ok;
+
+            do
+              echo 'Waiting for RabbitMQ Connection...'
+              sleep 2;
+          done
+        image: busybox:1.28
+        name: wait-for-queue
+      volumes:
+      - configMap:
+          name: stackstorm-st2-config
+        name: st2-config-vol
+      - name: st2-ssh-key-vol
+        secret:
+          items:
+          - key: private_key
+            mode: 256
+            path: stanley_rsa
+          secretName: stackstorm-st2-ssh
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: st2api
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: st2api
+      release: stackstorm
+  template:
+    metadata:
+      annotations:
+        checksum/config: 2cecfe3bc433d799634db9c906275d6ffa3ff5eb673367d9046a0acd70b4a77d
+        checksum/datastore-key: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
+      labels:
+        app: st2api
+        chart: stackstorm-ha-0.60.0
+        heritage: Helm
+        release: stackstorm
+        tier: backend
+        vendor: stackstorm
+    spec:
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+        image: stackstorm/st2api:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: st2api
+        ports:
+        - containerPort: 9101
+        resources:
+          requests:
+            cpu: 25m
+            memory: 150Mi
+        volumeMounts:
+        - mountPath: /etc/st2/st2.docker.conf
+          name: st2-config-vol
+          subPath: st2.docker.conf
+        - mountPath: /etc/st2/st2.user.conf
+          name: st2-config-vol
+          subPath: st2.user.conf
+      imagePullSecrets: null
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - "until nc -z -w 2 stackstorm-mongodb-headless 27017 && echo mongodb ok;\n
+          \ do \n    echo 'Waiting for MongoDB Connection...'\n    sleep 2;\ndone\n"
+        image: busybox:1.28
+        name: wait-for-db
+      - command:
+        - sh
+        - -c
+        - |
+          until nc -z -w 2 stackstorm-rabbitmq 5672 && echo rabbitmq ok;
+
+            do
+              echo 'Waiting for RabbitMQ Connection...'
+              sleep 2;
+          done
+        image: busybox:1.28
+        name: wait-for-queue
+      volumes:
+      - configMap:
+          name: stackstorm-st2-config
+        name: st2-config-vol
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: st2auth
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2auth
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: st2auth
+      release: stackstorm
+  template:
+    metadata:
+      annotations:
+        checksum/auth: 2a5ed78947ad6a3bf26036c76f41efcb2082d4e0c17b1cae9b3a2c7230443ca7
+        checksum/config: 2cecfe3bc433d799634db9c906275d6ffa3ff5eb673367d9046a0acd70b4a77d
+      labels:
+        app: st2auth
+        chart: stackstorm-ha-0.60.0
+        heritage: Helm
+        release: stackstorm
+        tier: backend
+        vendor: stackstorm
+    spec:
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+        image: stackstorm/st2auth:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: st2auth
+        ports:
+        - containerPort: 9100
+        resources:
+          requests:
+            cpu: 50m
+            memory: 85Mi
+        volumeMounts:
+        - mountPath: /etc/st2/st2.docker.conf
+          name: st2-config-vol
+          subPath: st2.docker.conf
+        - mountPath: /etc/st2/st2.user.conf
+          name: st2-config-vol
+          subPath: st2.user.conf
+        - mountPath: /etc/st2/htpasswd
+          name: htpasswd-vol
+          readOnly: true
+          subPath: htpasswd
+      imagePullSecrets: null
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - "until nc -z -w 2 stackstorm-mongodb-headless 27017 && echo mongodb ok;\n
+          \ do \n    echo 'Waiting for MongoDB Connection...'\n    sleep 2;\ndone\n"
+        image: busybox:1.28
+        name: wait-for-db
+      - command:
+        - sh
+        - -c
+        - |
+          until nc -z -w 2 stackstorm-rabbitmq 5672 && echo rabbitmq ok;
+
+            do
+              echo 'Waiting for RabbitMQ Connection...'
+              sleep 2;
+          done
+        image: busybox:1.28
+        name: wait-for-queue
+      - command:
+        - sh
+        - -ec
+        - printf "${ST2_AUTH_USERNAME}:$(openssl passwd -apr1 "${ST2_AUTH_PASSWORD}")\n"
+          > /tmp/st2/htpasswd
+        env:
+        - name: ST2_AUTH_USERNAME
+          valueFrom:
+            secretKeyRef:
+              key: username
+              name: stackstorm-st2-auth
+        - name: ST2_AUTH_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: password
+              name: stackstorm-st2-auth
+        image: stackstorm/st2auth:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: generate-htpasswd
+        volumeMounts:
+        - mountPath: /tmp/st2
+          name: htpasswd-vol
+      volumes:
+      - configMap:
+          name: stackstorm-st2-config
+        name: st2-config-vol
+      - emptyDir:
+          medium: Memory
+        name: htpasswd-vol
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: st2client
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2client
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: st2client
+      release: stackstorm
+  template:
+    metadata:
+      annotations:
+        checksum/auth: 2a5ed78947ad6a3bf26036c76f41efcb2082d4e0c17b1cae9b3a2c7230443ca7
+        checksum/config: 2cecfe3bc433d799634db9c906275d6ffa3ff5eb673367d9046a0acd70b4a77d
+        checksum/datastore-key: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
+        checksum/packs: f7ce2c2f8802015dab601c8f20e98b1657d48c26311bd956ac7b9e0250077051
+        checksum/rbac: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
+        checksum/ssh: fccd3cffc6939157ebf1ebfd1b289b23ce28bae718ff79b907f5fdb920b186ad
+      labels:
+        app: st2client
+        chart: stackstorm-ha-0.60.0
+        heritage: Helm
+        release: stackstorm
+        tier: backend
+        vendor: stackstorm
+    spec:
+      containers:
+      - command:
+        - bash
+        - -ec
+        - while true; do sleep 999; done
+        env:
+        - name: ST2CLIENT
+          value: "1"
+        envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+        image: stackstorm/st2actionrunner:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: st2client
+        resources:
+          requests:
+            cpu: 5m
+            memory: 5Mi
+        volumeMounts:
+        - mountPath: /etc/st2/st2.docker.conf
+          name: st2-config-vol
+          subPath: st2.docker.conf
+        - mountPath: /etc/st2/st2.user.conf
+          name: st2-config-vol
+          subPath: st2.user.conf
+        - mountPath: /opt/stackstorm/configs/
+          name: st2-pack-configs-vol
+        - mountPath: /root/.st2/
+          name: st2client-config-vol
+        - mountPath: /home/stanley/.ssh/
+          name: st2-ssh-key-vol
+          readOnly: true
+      imagePullSecrets: null
+      initContainers:
+      - command:
+        - sh
+        - -ec
+        - |
+          cat <<EOT > /root/.st2/config
+          [credentials]
+          username = ${ST2_AUTH_USERNAME}
+          password = ${ST2_AUTH_PASSWORD}
+          EOT
+        env:
+        - name: ST2_AUTH_USERNAME
+          valueFrom:
+            secretKeyRef:
+              key: username
+              name: stackstorm-st2-auth
+        - name: ST2_AUTH_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: password
+              name: stackstorm-st2-auth
+        envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+        image: stackstorm/st2actionrunner:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: generate-st2client-config
+        volumeMounts:
+        - mountPath: /root/.st2/
+          name: st2client-config-vol
+      volumes:
+      - configMap:
+          name: stackstorm-st2-config
+        name: st2-config-vol
+      - configMap:
+          name: stackstorm-st2-pack-configs
+        name: st2-pack-configs-vol
+      - emptyDir:
+          medium: Memory
+        name: st2client-config-vol
+      - name: st2-ssh-key-vol
+        secret:
+          items:
+          - key: private_key
+            mode: 256
+            path: stanley_rsa
+          secretName: stackstorm-st2-ssh
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: st2garbagecollector
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2garbagecollector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: st2garbagecollector
+      release: stackstorm
+  template:
+    metadata:
+      annotations:
+        checksum/config: 2cecfe3bc433d799634db9c906275d6ffa3ff5eb673367d9046a0acd70b4a77d
+      labels:
+        app: st2garbagecollector
+        chart: stackstorm-ha-0.60.0
+        heritage: Helm
+        release: stackstorm
+        tier: backend
+        vendor: stackstorm
+    spec:
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+        image: stackstorm/st2garbagecollector:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: st2garbagecollector
+        resources:
+          requests:
+            cpu: 10m
+            memory: 80Mi
+        volumeMounts:
+        - mountPath: /etc/st2/st2.docker.conf
+          name: st2-config-vol
+          subPath: st2.docker.conf
+        - mountPath: /etc/st2/st2.user.conf
+          name: st2-config-vol
+          subPath: st2.user.conf
+      imagePullSecrets: null
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - "until nc -z -w 2 stackstorm-mongodb-headless 27017 && echo mongodb ok;\n
+          \ do \n    echo 'Waiting for MongoDB Connection...'\n    sleep 2;\ndone\n"
+        image: busybox:1.28
+        name: wait-for-db
+      - command:
+        - sh
+        - -c
+        - |
+          until nc -z -w 2 stackstorm-rabbitmq 5672 && echo rabbitmq ok;
+
+            do
+              echo 'Waiting for RabbitMQ Connection...'
+              sleep 2;
+          done
+        image: busybox:1.28
+        name: wait-for-queue
+      volumes:
+      - configMap:
+          name: stackstorm-st2-config
+        name: st2-config-vol
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: st2notifier
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2notifier
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: st2notifier
+      release: stackstorm
+  template:
+    metadata:
+      annotations:
+        checksum/config: 2cecfe3bc433d799634db9c906275d6ffa3ff5eb673367d9046a0acd70b4a77d
+      labels:
+        app: st2notifier
+        chart: stackstorm-ha-0.60.0
+        heritage: Helm
+        release: stackstorm
+        tier: backend
+        vendor: stackstorm
+    spec:
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+        image: stackstorm/st2notifier:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: st2notifier
+        resources:
+          requests:
+            cpu: 50m
+            memory: 75Mi
+        volumeMounts:
+        - mountPath: /etc/st2/st2.docker.conf
+          name: st2-config-vol
+          subPath: st2.docker.conf
+        - mountPath: /etc/st2/st2.user.conf
+          name: st2-config-vol
+          subPath: st2.user.conf
+      imagePullSecrets: null
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - "until nc -z -w 2 stackstorm-mongodb-headless 27017 && echo mongodb ok;\n
+          \ do \n    echo 'Waiting for MongoDB Connection...'\n    sleep 2;\ndone\n"
+        image: busybox:1.28
+        name: wait-for-db
+      - command:
+        - sh
+        - -c
+        - |
+          until nc -z -w 2 stackstorm-rabbitmq 5672 && echo rabbitmq ok;
+
+            do
+              echo 'Waiting for RabbitMQ Connection...'
+              sleep 2;
+          done
+        image: busybox:1.28
+        name: wait-for-queue
+      volumes:
+      - configMap:
+          name: stackstorm-st2-config
+        name: st2-config-vol
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: st2rulesengine
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2rulesengine
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: st2rulesengine
+      release: stackstorm
+  template:
+    metadata:
+      annotations:
+        checksum/config: 2cecfe3bc433d799634db9c906275d6ffa3ff5eb673367d9046a0acd70b4a77d
+      labels:
+        app: st2rulesengine
+        chart: stackstorm-ha-0.60.0
+        heritage: Helm
+        release: stackstorm
+        tier: backend
+        vendor: stackstorm
+    spec:
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+        image: stackstorm/st2rulesengine:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: st2rulesengine
+        resources:
+          requests:
+            cpu: 25m
+            memory: 75Mi
+        volumeMounts:
+        - mountPath: /etc/st2/st2.docker.conf
+          name: st2-config-vol
+          subPath: st2.docker.conf
+        - mountPath: /etc/st2/st2.user.conf
+          name: st2-config-vol
+          subPath: st2.user.conf
+      imagePullSecrets: null
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - "until nc -z -w 2 stackstorm-mongodb-headless 27017 && echo mongodb ok;\n
+          \ do \n    echo 'Waiting for MongoDB Connection...'\n    sleep 2;\ndone\n"
+        image: busybox:1.28
+        name: wait-for-db
+      - command:
+        - sh
+        - -c
+        - |
+          until nc -z -w 2 stackstorm-rabbitmq 5672 && echo rabbitmq ok;
+
+            do
+              echo 'Waiting for RabbitMQ Connection...'
+              sleep 2;
+          done
+        image: busybox:1.28
+        name: wait-for-queue
+      volumes:
+      - configMap:
+          name: stackstorm-st2-config
+        name: st2-config-vol
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: st2scheduler
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2scheduler
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: st2scheduler
+      release: stackstorm
+  template:
+    metadata:
+      annotations:
+        checksum/config: 2cecfe3bc433d799634db9c906275d6ffa3ff5eb673367d9046a0acd70b4a77d
+        checksum/datastore-key: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
+      labels:
+        app: st2scheduler
+        chart: stackstorm-ha-0.60.0
+        heritage: Helm
+        release: stackstorm
+        tier: backend
+        vendor: stackstorm
+    spec:
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+        image: stackstorm/st2scheduler:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: st2scheduler
+        resources:
+          requests:
+            cpu: 50m
+            memory: 75Mi
+        volumeMounts:
+        - mountPath: /etc/st2/st2.docker.conf
+          name: st2-config-vol
+          subPath: st2.docker.conf
+        - mountPath: /etc/st2/st2.user.conf
+          name: st2-config-vol
+          subPath: st2.user.conf
+      imagePullSecrets: null
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - "until nc -z -w 2 stackstorm-mongodb-headless 27017 && echo mongodb ok;\n
+          \ do \n    echo 'Waiting for MongoDB Connection...'\n    sleep 2;\ndone\n"
+        image: busybox:1.28
+        name: wait-for-db
+      - command:
+        - sh
+        - -c
+        - |
+          until nc -z -w 2 stackstorm-rabbitmq 5672 && echo rabbitmq ok;
+
+            do
+              echo 'Waiting for RabbitMQ Connection...'
+              sleep 2;
+          done
+        image: busybox:1.28
+        name: wait-for-queue
+      volumes:
+      - configMap:
+          name: stackstorm-st2-config
+        name: st2-config-vol
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: st2sensorcontainer
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2sensorcontainer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: st2sensorcontainer
+      release: stackstorm
+  template:
+    metadata:
+      annotations:
+        checksum/config: 2cecfe3bc433d799634db9c906275d6ffa3ff5eb673367d9046a0acd70b4a77d
+        checksum/datastore-key: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
+        checksum/packs: f7ce2c2f8802015dab601c8f20e98b1657d48c26311bd956ac7b9e0250077051
+      labels:
+        app: st2sensorcontainer
+        chart: stackstorm-ha-0.60.0
+        heritage: Helm
+        release: stackstorm
+        tier: backend
+        vendor: stackstorm
+    spec:
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+        image: stackstorm/st2sensorcontainer:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: st2sensorcontainer
+        resources:
+          requests:
+            cpu: 50m
+            memory: 100Mi
+        volumeMounts:
+        - mountPath: /etc/st2/st2.docker.conf
+          name: st2-config-vol
+          subPath: st2.docker.conf
+        - mountPath: /etc/st2/st2.user.conf
+          name: st2-config-vol
+          subPath: st2.user.conf
+      imagePullSecrets: null
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - "until nc -z -w 2 stackstorm-mongodb-headless 27017 && echo mongodb ok;\n
+          \ do \n    echo 'Waiting for MongoDB Connection...'\n    sleep 2;\ndone\n"
+        image: busybox:1.28
+        name: wait-for-db
+      - command:
+        - sh
+        - -c
+        - |
+          until nc -z -w 2 stackstorm-rabbitmq 5672 && echo rabbitmq ok;
+
+            do
+              echo 'Waiting for RabbitMQ Connection...'
+              sleep 2;
+          done
+        image: busybox:1.28
+        name: wait-for-queue
+      volumes:
+      - configMap:
+          name: stackstorm-st2-config
+        name: st2-config-vol
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: st2stream
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2stream
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: st2stream
+      release: stackstorm
+  template:
+    metadata:
+      annotations:
+        checksum/config: 2cecfe3bc433d799634db9c906275d6ffa3ff5eb673367d9046a0acd70b4a77d
+      labels:
+        app: st2stream
+        chart: stackstorm-ha-0.60.0
+        heritage: Helm
+        release: stackstorm
+        tier: backend
+        vendor: stackstorm
+    spec:
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+        image: stackstorm/st2stream:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: st2stream
+        ports:
+        - containerPort: 9102
+        resources:
+          requests:
+            cpu: 50m
+            memory: 100Mi
+        volumeMounts:
+        - mountPath: /etc/st2/st2.docker.conf
+          name: st2-config-vol
+          subPath: st2.docker.conf
+        - mountPath: /etc/st2/st2.user.conf
+          name: st2-config-vol
+          subPath: st2.user.conf
+      imagePullSecrets: null
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - "until nc -z -w 2 stackstorm-mongodb-headless 27017 && echo mongodb ok;\n
+          \ do \n    echo 'Waiting for MongoDB Connection...'\n    sleep 2;\ndone\n"
+        image: busybox:1.28
+        name: wait-for-db
+      - command:
+        - sh
+        - -c
+        - |
+          until nc -z -w 2 stackstorm-rabbitmq 5672 && echo rabbitmq ok;
+
+            do
+              echo 'Waiting for RabbitMQ Connection...'
+              sleep 2;
+          done
+        image: busybox:1.28
+        name: wait-for-queue
+      volumes:
+      - configMap:
+          name: stackstorm-st2-config
+        name: st2-config-vol
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: st2timersengine
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2timersengine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: st2timersengine
+      release: stackstorm
+  template:
+    metadata:
+      annotations:
+        checksum/config: 2cecfe3bc433d799634db9c906275d6ffa3ff5eb673367d9046a0acd70b4a77d
+      labels:
+        app: st2timersengine
+        chart: stackstorm-ha-0.60.0
+        heritage: Helm
+        release: stackstorm
+        tier: backend
+        vendor: stackstorm
+    spec:
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+        image: stackstorm/st2timersengine:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: st2timersengine
+        resources:
+          requests:
+            cpu: 10m
+            memory: 75Mi
+        volumeMounts:
+        - mountPath: /etc/st2/st2.docker.conf
+          name: st2-config-vol
+          subPath: st2.docker.conf
+        - mountPath: /etc/st2/st2.user.conf
+          name: st2-config-vol
+          subPath: st2.user.conf
+      imagePullSecrets: null
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - "until nc -z -w 2 stackstorm-mongodb-headless 27017 && echo mongodb ok;\n
+          \ do \n    echo 'Waiting for MongoDB Connection...'\n    sleep 2;\ndone\n"
+        image: busybox:1.28
+        name: wait-for-db
+      - command:
+        - sh
+        - -c
+        - |
+          until nc -z -w 2 stackstorm-rabbitmq 5672 && echo rabbitmq ok;
+
+            do
+              echo 'Waiting for RabbitMQ Connection...'
+              sleep 2;
+          done
+        image: busybox:1.28
+        name: wait-for-queue
+      volumes:
+      - configMap:
+          name: stackstorm-st2-config
+        name: st2-config-vol
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: st2web
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: frontend
+    vendor: stackstorm
+  name: stackstorm-st2web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: st2web
+      release: stackstorm
+  template:
+    metadata:
+      annotations:
+        checksum/config: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
+      labels:
+        app: st2web
+        chart: stackstorm-ha-0.60.0
+        heritage: Helm
+        release: stackstorm
+        tier: frontend
+        vendor: stackstorm
+    spec:
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+            optional: true
+        image: stackstorm/st2web:3.5dev
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+            scheme: HTTP
+          initialDelaySeconds: 1
+        name: st2web
+        ports:
+        - containerPort: 80
+        resources:
+          limits:
+            memory: 100Mi
+          requests:
+            cpu: 50m
+            memory: 25Mi
+        volumeMounts: []
+      imagePullSecrets: null
+      volumes: []
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: st2workflowengine
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-st2workflowengine
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: st2workflowengine
+      release: stackstorm
+  template:
+    metadata:
+      annotations:
+        checksum/config: 2cecfe3bc433d799634db9c906275d6ffa3ff5eb673367d9046a0acd70b4a77d
+        checksum/datastore-key: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
+      labels:
+        app: st2workflowengine
+        chart: stackstorm-ha-0.60.0
+        heritage: Helm
+        release: stackstorm
+        tier: backend
+        vendor: stackstorm
+    spec:
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+        image: stackstorm/st2workflowengine:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: st2workflowengine
+        resources:
+          requests:
+            cpu: 100m
+            memory: 200Mi
+        volumeMounts:
+        - mountPath: /etc/st2/st2.docker.conf
+          name: st2-config-vol
+          subPath: st2.docker.conf
+        - mountPath: /etc/st2/st2.user.conf
+          name: st2-config-vol
+          subPath: st2.user.conf
+      imagePullSecrets: null
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - "until nc -z -w 2 stackstorm-mongodb-headless 27017 && echo mongodb ok;\n
+          \ do \n    echo 'Waiting for MongoDB Connection...'\n    sleep 2;\ndone\n"
+        image: busybox:1.28
+        name: wait-for-db
+      - command:
+        - sh
+        - -c
+        - |
+          until nc -z -w 2 stackstorm-rabbitmq 5672 && echo rabbitmq ok;
+
+            do
+              echo 'Waiting for RabbitMQ Connection...'
+              sleep 2;
+          done
+        image: busybox:1.28
+        name: wait-for-queue
+      volumes:
+      - configMap:
+          name: stackstorm-st2-config
+        name: st2-config-vol
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app.kubernetes.io/component: mongodb
+    app.kubernetes.io/instance: stackstorm
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: mongodb
+    helm.sh/chart: mongodb-10.0.1
+  name: stackstorm-mongodb
+  namespace: stackstorm
+spec:
+  podManagementPolicy: OrderedReady
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: mongodb
+      app.kubernetes.io/instance: stackstorm
+      app.kubernetes.io/name: mongodb
+  serviceName: stackstorm-mongodb-headless
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: mongodb
+        app.kubernetes.io/instance: stackstorm
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/name: mongodb
+        helm.sh/chart: mongodb-10.0.1
+    spec:
+      containers:
+      - command:
+        - /scripts/setup.sh
+        env:
+        - name: BITNAMI_DEBUG
+          value: "false"
+        - name: MY_POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: MY_POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: K8S_SERVICE_NAME
+          value: stackstorm-mongodb-headless
+        - name: MONGODB_INITIAL_PRIMARY_HOST
+          value: stackstorm-mongodb-0.$(K8S_SERVICE_NAME).$(MY_POD_NAMESPACE).svc.cluster.local
+        - name: MONGODB_REPLICA_SET_NAME
+          value: rs0
+        - name: MONGODB_ADVERTISED_HOSTNAME
+          value: $(MY_POD_NAME).$(K8S_SERVICE_NAME).$(MY_POD_NAMESPACE).svc.cluster.local
+        - name: MONGODB_USERNAME
+          value: st2-admin
+        - name: MONGODB_DATABASE
+          value: st2
+        - name: MONGODB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: mongodb-password
+              name: stackstorm-mongodb
+        - name: MONGODB_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: mongodb-root-password
+              name: stackstorm-mongodb
+        - name: MONGODB_REPLICA_SET_KEY
+          valueFrom:
+            secretKeyRef:
+              key: mongodb-replica-set-key
+              name: stackstorm-mongodb
+        - name: ALLOW_EMPTY_PASSWORD
+          value: "no"
+        - name: MONGODB_SYSTEM_LOG_VERBOSITY
+          value: "0"
+        - name: MONGODB_DISABLE_SYSTEM_LOG
+          value: "no"
+        - name: MONGODB_ENABLE_IPV6
+          value: "no"
+        - name: MONGODB_ENABLE_DIRECTORY_PER_DB
+          value: "no"
+        image: docker.io/bitnami/mongodb:4.0
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          exec:
+            command:
+            - mongo
+            - --eval
+            - db.adminCommand('ping')
+          failureThreshold: 6
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        name: mongodb
+        ports:
+        - containerPort: 27017
+          name: mongodb
+        readinessProbe:
+          exec:
+            command:
+            - mongo
+            - --eval
+            - db.adminCommand('ping')
+          failureThreshold: 6
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        resources:
+          limits: {}
+          requests: {}
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+        volumeMounts:
+        - mountPath: /bitnami/mongodb
+          name: datadir
+          subPath: null
+        - mountPath: /scripts/setup.sh
+          name: scripts
+          subPath: setup.sh
+      securityContext:
+        fsGroup: 1001
+        sysctls: []
+      serviceAccountName: stackstorm-mongodb
+      volumes:
+      - configMap:
+          defaultMode: 493
+          name: stackstorm-mongodb-scripts
+        name: scripts
+  updateStrategy:
+    type: RollingUpdate
+  volumeClaimTemplates:
+  - metadata:
+      name: datadir
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 8Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app.kubernetes.io/instance: stackstorm
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: rabbitmq
+    helm.sh/chart: rabbitmq-8.0.2
+  name: stackstorm-rabbitmq
+  namespace: stackstorm
+spec:
+  podManagementPolicy: OrderedReady
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: stackstorm
+      app.kubernetes.io/name: rabbitmq
+  serviceName: stackstorm-rabbitmq-headless
+  template:
+    metadata:
+      annotations:
+        checksum/secret: c6145e8074ef7185820f93f5c56940dc7cec7e46acd445be115c06b050cf16bf
+      labels:
+        app.kubernetes.io/instance: stackstorm
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/name: rabbitmq
+        helm.sh/chart: rabbitmq-8.0.2
+    spec:
+      containers:
+      - env:
+        - name: BITNAMI_DEBUG
+          value: "false"
+        - name: MY_POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: MY_POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: MY_POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: K8S_SERVICE_NAME
+          value: stackstorm-rabbitmq-headless
+        - name: K8S_ADDRESS_TYPE
+          value: hostname
+        - name: RABBITMQ_FORCE_BOOT
+          value: "yes"
+        - name: RABBITMQ_NODE_NAME
+          value: rabbit@$(MY_POD_NAME).$(K8S_SERVICE_NAME).$(MY_POD_NAMESPACE).svc.cluster.local
+        - name: K8S_HOSTNAME_SUFFIX
+          value: .$(K8S_SERVICE_NAME).$(MY_POD_NAMESPACE).svc.cluster.local
+        - name: RABBITMQ_MNESIA_DIR
+          value: /bitnami/rabbitmq/mnesia/$(RABBITMQ_NODE_NAME)
+        - name: RABBITMQ_LDAP_ENABLE
+          value: "no"
+        - name: RABBITMQ_LOGS
+          value: '-'
+        - name: RABBITMQ_ULIMIT_NOFILES
+          value: "65536"
+        - name: RABBITMQ_USE_LONGNAME
+          value: "true"
+        - name: RABBITMQ_ERL_COOKIE
+          valueFrom:
+            secretKeyRef:
+              key: rabbitmq-erlang-cookie
+              name: stackstorm-rabbitmq
+        - name: RABBITMQ_USERNAME
+          value: admin
+        - name: RABBITMQ_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: rabbitmq-password
+              name: stackstorm-rabbitmq
+        - name: RABBITMQ_PLUGINS
+          value: rabbitmq_management, rabbitmq_peer_discovery_k8s, rabbitmq_auth_backend_ldap
+        image: docker.io/bitnami/rabbitmq:3.8.9-debian-10-r37
+        imagePullPolicy: IfNotPresent
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - bash
+              - -ec
+              - rabbitmqctl stop_app
+        livenessProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -ec
+            - rabbitmq-diagnostics -q check_running
+          failureThreshold: 6
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          successThreshold: 1
+          timeoutSeconds: 20
+        name: rabbitmq
+        ports:
+        - containerPort: 5672
+          name: amqp
+        - containerPort: 25672
+          name: dist
+        - containerPort: 15672
+          name: stats
+        - containerPort: 4369
+          name: epmd
+        readinessProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -ec
+            - rabbitmq-diagnostics -q check_running
+          failureThreshold: 3
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          successThreshold: 1
+          timeoutSeconds: 20
+        resources:
+          limits: {}
+          requests: {}
+        volumeMounts:
+        - mountPath: /bitnami/rabbitmq/conf
+          name: configuration
+        - mountPath: /bitnami/rabbitmq/mnesia
+          name: data
+        - mountPath: /app
+          name: load-definition-volume
+          readOnly: true
+      securityContext:
+        fsGroup: 1001
+        runAsUser: 1001
+      serviceAccountName: stackstorm-rabbitmq
+      terminationGracePeriodSeconds: 10
+      volumes:
+      - configMap:
+          items:
+          - key: rabbitmq.conf
+            path: rabbitmq.conf
+          name: stackstorm-rabbitmq-config
+        name: configuration
+      - name: load-definition-volume
+        secret:
+          secretName: stackstorm-rabbitmq-definitions
+  updateStrategy:
+    type: RollingUpdate
+  volumeClaimTemplates:
+  - metadata:
+      labels:
+        app.kubernetes.io/instance: stackstorm
+        app.kubernetes.io/name: rabbitmq
+      name: data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 8Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: redis
+    chart: redis-12.3.2
+    heritage: Helm
+    release: stackstorm
+  name: stackstorm-redis-node
+  namespace: stackstorm
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis
+      release: stackstorm
+      role: node
+  serviceName: stackstorm-redis-headless
+  template:
+    metadata:
+      annotations:
+        checksum/configmap: c003883206d97ae44c44ac4e32ec939437fbe797cd083899d2fc6c977eb673ba
+        checksum/health: 02faf9bdeab824c62e78e5d01ff1f7f52fafe6263369a28392475d4cd3b80a81
+        checksum/secret: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+      labels:
+        app: redis
+        chart: redis-12.3.2
+        release: stackstorm
+        role: node
+    spec:
+      containers:
+      - command:
+        - /bin/bash
+        - -c
+        - /opt/bitnami/scripts/start-scripts/start-node.sh
+        env:
+        - name: REDIS_MASTER_PORT_NUMBER
+          value: "6379"
+        - name: ALLOW_EMPTY_PASSWORD
+          value: "yes"
+        - name: REDIS_TLS_ENABLED
+          value: "no"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: REDIS_DATA_DIR
+          value: /data
+        image: docker.io/bitnami/redis:6.0.9-debian-10-r66
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - /health/ping_liveness_local.sh 5
+          failureThreshold: 5
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        name: redis
+        ports:
+        - containerPort: 6379
+          name: redis
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - /health/ping_readiness_local.sh 5
+          failureThreshold: 5
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 10
+        resources: null
+        securityContext:
+          runAsUser: 1001
+        volumeMounts:
+        - mountPath: /opt/bitnami/scripts/start-scripts
+          name: start-scripts
+        - mountPath: /health
+          name: health
+        - mountPath: /data
+          name: redis-data
+        - mountPath: /opt/bitnami/redis/mounted-etc
+          name: config
+        - mountPath: /opt/bitnami/redis/etc
+          name: redis-tmp-conf
+      - command:
+        - /bin/bash
+        - -c
+        - /opt/bitnami/scripts/start-scripts/start-sentinel.sh
+        env:
+        - name: ALLOW_EMPTY_PASSWORD
+          value: "yes"
+        - name: REDIS_SENTINEL_TLS_ENABLED
+          value: "no"
+        - name: REDIS_SENTINEL_PORT
+          value: "26379"
+        image: docker.io/bitnami/redis-sentinel:6.0.9-debian-10-r66
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - /health/ping_sentinel.sh 5
+          failureThreshold: 5
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          successThreshold: 1
+          timeoutSeconds: 5
+        name: sentinel
+        ports:
+        - containerPort: 26379
+          name: redis-sentinel
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - /health/ping_sentinel.sh 5
+          failureThreshold: 5
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          successThreshold: 1
+          timeoutSeconds: 1
+        resources: null
+        securityContext:
+          runAsUser: 1001
+        volumeMounts:
+        - mountPath: /opt/bitnami/scripts/start-scripts
+          name: start-scripts
+        - mountPath: /health
+          name: health
+        - mountPath: /data
+          name: redis-data
+          subPath: null
+        - mountPath: /opt/bitnami/redis-sentinel/mounted-etc
+          name: config
+        - mountPath: /opt/bitnami/redis-sentinel/etc
+          name: sentinel-tmp-conf
+      securityContext:
+        fsGroup: 1001
+      serviceAccountName: default
+      volumes:
+      - configMap:
+          defaultMode: 493
+          name: stackstorm-redis-scripts
+        name: start-scripts
+      - configMap:
+          defaultMode: 493
+          name: stackstorm-redis-health
+        name: health
+      - configMap:
+          name: stackstorm-redis
+        name: config
+      - emptyDir: {}
+        name: sentinel-tmp-conf
+      - emptyDir: {}
+        name: redis-tmp-conf
+  updateStrategy:
+    type: RollingUpdate
+  volumeClaimTemplates:
+  - metadata:
+      labels:
+        app: redis
+        component: slave
+        heritage: Helm
+        release: stackstorm
+      name: redis-data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 8Gi
+      selector: null
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  annotations:
+    helm.sh/hook: post-install, post-upgrade, post-rollback
+    helm.sh/hook-delete-policy: before-hook-creation
+    helm.sh/hook-weight: "6"
+  labels:
+    app: st2
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-job-st2-apikey-load
+spec:
+  template:
+    metadata:
+      annotations:
+        checksum/apikeys: 8455e8c50881009a7faeeb47ef3619c9e977e7cd73d0ed17173c72c2572c4a6f
+        checksum/urls: 03b18c4239e1df1556bbae2fa6ed6e2e37dd493bcce28682c5195640e86a67aa
+      labels:
+        app: st2
+        chart: stackstorm-ha-0.60.0
+        heritage: Helm
+        release: stackstorm
+        tier: backend
+        vendor: stackstorm
+      name: job-st2-apikey-load
+    spec:
+      containers:
+      - command:
+        - st2
+        - apikey
+        - load
+        - /etc/st2/apikeys.yaml
+        envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+        image: stackstorm/st2actionrunner:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: st2-apikey-load
+        volumeMounts:
+        - mountPath: /root/.st2/
+          name: st2client-config-vol
+        - mountPath: /etc/st2/apikeys.yaml
+          name: st2-apikeys-vol
+          subPath: apikeys.yaml
+      imagePullSecrets: null
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - "until nc -z -w 2 stackstorm-mongodb-headless 27017 && echo mongodb ok;\n
+          \ do \n    echo 'Waiting for MongoDB Connection...'\n    sleep 2;\ndone\n"
+        image: busybox:1.28
+        name: wait-for-db
+      - command:
+        - sh
+        - -c
+        - |
+          until nc -z -w 2 stackstorm-st2api 9101 && echo st2api ready;
+
+            do sleep 2;
+          done
+        image: busybox:1.28
+        name: wait-for-api
+      - command:
+        - sh
+        - -ec
+        - |
+          cat <<EOT > /root/.st2/config
+          [credentials]
+          username = ${ST2_AUTH_USERNAME}
+          password = ${ST2_AUTH_PASSWORD}
+          EOT
+        env:
+        - name: ST2_AUTH_USERNAME
+          valueFrom:
+            secretKeyRef:
+              key: username
+              name: stackstorm-st2-auth
+        - name: ST2_AUTH_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: password
+              name: stackstorm-st2-auth
+        envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+        image: stackstorm/st2actionrunner:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: generate-st2client-config
+        volumeMounts:
+        - mountPath: /root/.st2/
+          name: st2client-config-vol
+      restartPolicy: OnFailure
+      volumes:
+      - emptyDir:
+          medium: Memory
+        name: st2client-config-vol
+      - name: st2-apikeys-vol
+        secret:
+          secretName: stackstorm-st2-apikeys
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  annotations:
+    helm.sh/hook: post-install, post-upgrade, post-rollback
+    helm.sh/hook-delete-policy: before-hook-creation
+    helm.sh/hook-weight: "6"
+  labels:
+    app: st2
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-job-st2-key-load
+spec:
+  template:
+    metadata:
+      annotations:
+        checksum/config: 2cecfe3bc433d799634db9c906275d6ffa3ff5eb673367d9046a0acd70b4a77d
+        checksum/urls: 03b18c4239e1df1556bbae2fa6ed6e2e37dd493bcce28682c5195640e86a67aa
+      labels:
+        app: st2
+        chart: stackstorm-ha-0.60.0
+        heritage: Helm
+        release: stackstorm
+        tier: backend
+        vendor: stackstorm
+      name: job-st2-key-load
+    spec:
+      containers:
+      - command:
+        - st2
+        - key
+        - load
+        - /etc/st2/st2kv.yaml
+        envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+        image: stackstorm/st2actionrunner:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: st2-key-load
+        volumeMounts:
+        - mountPath: /etc/st2/st2.docker.conf
+          name: st2-config-vol
+          subPath: st2.docker.conf
+        - mountPath: /etc/st2/st2.user.conf
+          name: st2-config-vol
+          subPath: st2.user.conf
+        - mountPath: /root/.st2/
+          name: st2client-config-vol
+        - mountPath: /etc/st2/st2kv.yaml
+          name: st2-kv-vol
+          subPath: st2kv.yaml
+      imagePullSecrets: null
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - "until nc -z -w 2 stackstorm-mongodb-headless 27017 && echo mongodb ok;\n
+          \ do \n    echo 'Waiting for MongoDB Connection...'\n    sleep 2;\ndone\n"
+        image: busybox:1.28
+        name: wait-for-db
+      - command:
+        - sh
+        - -ec
+        - |
+          cat <<EOT > /root/.st2/config
+          [credentials]
+          username = ${ST2_AUTH_USERNAME}
+          password = ${ST2_AUTH_PASSWORD}
+          EOT
+        env:
+        - name: ST2_AUTH_USERNAME
+          valueFrom:
+            secretKeyRef:
+              key: username
+              name: stackstorm-st2-auth
+        - name: ST2_AUTH_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: password
+              name: stackstorm-st2-auth
+        envFrom:
+        - configMapRef:
+            name: stackstorm-st2-urls
+        image: stackstorm/st2actionrunner:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: generate-st2client-config
+        volumeMounts:
+        - mountPath: /root/.st2/
+          name: st2client-config-vol
+      restartPolicy: OnFailure
+      volumes:
+      - configMap:
+          name: stackstorm-st2-config
+        name: st2-config-vol
+      - emptyDir:
+          medium: Memory
+        name: st2client-config-vol
+      - name: st2-kv-vol
+        secret:
+          secretName: stackstorm-st2-kv
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  annotations:
+    helm.sh/hook: post-install, post-upgrade, post-rollback
+    helm.sh/hook-delete-policy: before-hook-creation
+    helm.sh/hook-weight: "7"
+  labels:
+    app: st2-register-content
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: backend
+    vendor: stackstorm
+  name: stackstorm-job-st2-register-content
+spec:
+  template:
+    metadata:
+      annotations:
+        checksum/config: 2cecfe3bc433d799634db9c906275d6ffa3ff5eb673367d9046a0acd70b4a77d
+        checksum/packs: f7ce2c2f8802015dab601c8f20e98b1657d48c26311bd956ac7b9e0250077051
+      labels:
+        app: st2-register-content
+        chart: stackstorm-ha-0.60.0
+        heritage: Helm
+        release: stackstorm
+        tier: backend
+        vendor: stackstorm
+      name: job-st2-register-content
+    spec:
+      containers:
+      - command:
+        - st2-register-content
+        - --config-file=/etc/st2/st2.conf
+        - --config-file=/etc/st2/st2.docker.conf
+        - --config-file=/etc/st2/st2.user.conf
+        - --register-all
+        - --register-fail-on-failure
+        image: stackstorm/st2actionrunner:3.5dev
+        imagePullPolicy: IfNotPresent
+        name: st2-register-content
+        volumeMounts:
+        - mountPath: /etc/st2/st2.docker.conf
+          name: st2-config-vol
+          subPath: st2.docker.conf
+        - mountPath: /etc/st2/st2.user.conf
+          name: st2-config-vol
+          subPath: st2.user.conf
+        - mountPath: /opt/stackstorm/configs/
+          name: st2-pack-configs-vol
+      imagePullSecrets: null
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - "until nc -z -w 2 stackstorm-mongodb-headless 27017 && echo mongodb ok;\n
+          \ do \n    echo 'Waiting for MongoDB Connection...'\n    sleep 2;\ndone\n"
+        image: busybox:1.28
+        name: wait-for-db
+      restartPolicy: OnFailure
+      volumes:
+      - configMap:
+          name: stackstorm-st2-config
+        name: st2-config-vol
+      - configMap:
+          name: stackstorm-st2-pack-configs
+        name: st2-pack-configs-vol
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    helm.sh/hook: test-success
+    helm.sh/hook-delete-policy: hook-succeeded
+  labels:
+    app: st2tests
+    chart: stackstorm-ha-0.60.0
+    heritage: Helm
+    release: stackstorm
+    tier: tests
+    vendor: stackstorm
+  name: stackstorm-st2tests
+spec:
+  containers:
+  - command:
+    - /tools/bats/libexec/bats
+    - /tests/st2tests.sh
+    env:
+    - name: BATS_HELPERS_DIR
+      value: /tools/bats-helpers/
+    - name: ST2_AUTH_USERNAME
+      valueFrom:
+        secretKeyRef:
+          key: username
+          name: stackstorm-st2-auth
+    - name: ST2_AUTH_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          key: password
+          name: stackstorm-st2-auth
+    - name: ST2_VERSION
+      value: 3.5dev
+    - name: ST2_RBAC_ENABLED
+      value: "false"
+    envFrom:
+    - configMapRef:
+        name: stackstorm-st2-urls
+    image: stackstorm/st2actionrunner:3.5dev
+    imagePullPolicy: IfNotPresent
+    name: st2tests
+    volumeMounts:
+    - mountPath: /tools
+      name: tools
+    - mountPath: /tests
+      name: tests
+  initContainers:
+  - command:
+    - bash
+    - -ec
+    - |
+      cp -R /opt/bats/ ${BATS_HELPERS_DIR} /tools/
+    image: dduportal/bats:latest
+    name: test-framework
+    volumeMounts:
+    - mountPath: /tools
+      name: tools
+  restartPolicy: Never
+  volumes:
+  - emptyDir: {}
+    name: tools
+  - configMap:
+      name: stackstorm-st2tests
+    name: tests
